@@ -259,7 +259,20 @@ function createWhatsAppRuntime(config) {
 
       const from = await resolveSenderPhone(msg)
       if (!from) {
-        console.warn('[wa] could not resolve sender phone from', msg.from, 'dataKeys=', Object.keys(msg._data || {}))
+        console.warn(
+          '[wa] could not resolve sender phone from',
+          msg.from,
+          'dataKeys=',
+          Object.keys(msg._data || {}),
+        )
+        try {
+          await replyToMessage(
+            msg,
+            '無法識別你的 WhatsApp 電話號碼，請聯絡管理員綁定後再試。\nCould not resolve your phone number. Ask an admin to bind your number.',
+          )
+        } catch (e) {
+          console.error('[wa] resolve-fail reply failed', e instanceof Error ? e.message : e)
+        }
         return
       }
       if (!isPhoneAllowed(from)) {
