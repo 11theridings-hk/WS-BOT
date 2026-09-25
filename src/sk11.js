@@ -1,7 +1,8 @@
 'use strict'
 
 /**
- * Forward inbound WhatsApp text to SK11; returns reply text.
+ * Forward inbound WhatsApp text to SK11.
+ * @returns {Promise<string|null>} reply text, or null when SK11 says ignored (do not send).
  */
 async function forwardInbound(config, { from, text, messageId }) {
   const controller = new AbortController()
@@ -23,7 +24,11 @@ async function forwardInbound(config, { from, text, messageId }) {
       const err = json?.error || `SK11 HTTP ${res.status}`
       throw new Error(err)
     }
-    if (typeof json.reply !== 'string' || !json.reply) {
+    // Non-allowlist / silent deny → no WhatsApp reply
+    if (json.ignored === true || json.reply == null) {
+      return null
+    }
+    if (typeof json.reply !== 'string' || !json.reply.trim()) {
       throw new Error('SK11 response missing reply')
     }
     return json.reply

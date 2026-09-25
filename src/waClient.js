@@ -206,7 +206,19 @@ function createWhatsAppRuntime(config) {
       } catch (e) {
         const err = e instanceof Error ? e.message : 'SK11 error'
         console.error('[wa] SK11 forward failed', err)
-        reply = '系統暫時無法處理，請稍後再試或登入網頁操作。\nSystem temporarily unavailable. Please try again or use the web app.'
+        // Common: Unauthorized = BRIDGE_SECRET mismatch with Railway
+        reply =
+          '系統暫時無法處理，請稍後再試或登入網頁操作。\n' +
+          'System temporarily unavailable. Please try again or use the web app.'
+        if (/Unauthorized|401/i.test(err)) {
+          console.error('[wa] hint: check BRIDGE_SECRET matches Railway WHATSAPP_BRIDGE_SECRET')
+        }
+      }
+
+      // null = SK11 ignored (allowlist) — do not send WhatsApp reply
+      if (reply == null) {
+        console.log('[wa] SK11 ignored inbound; no reply sent', from)
+        return
       }
 
       const sent = await replyToMessage(msg, reply)
