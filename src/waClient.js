@@ -43,14 +43,24 @@ function createWhatsAppRuntime(config) {
     return String(value || '').replace(/\D/g, '')
   }
 
+  function isLidJid(value) {
+    return String(value || '').includes('@lid')
+  }
+
   /**
-   * Extract E.164-ish digits from chat id or PN fields.
-   * Supports classic `@c.us` and newer `@lid` (needs senderPn / contact).
+   * Extract E.164-ish digits from chat id / PN fields.
+   * Never treat `@lid` identifiers as phone numbers (that was forwarding
+   * LID ids like 9761… to SK11 → allowlist deny → silent no-reply).
    */
-  function phoneFromChatId(chatId) {
-    const raw = String(chatId || '')
-    if (raw.endsWith('@lid')) return ''
-    return digitsOnly(raw.split('@')[0])
+  function phoneFromValue(value, lidDigitsToReject = '') {
+    const raw = String(value || '').trim()
+    if (!raw || isLidJid(raw)) return ''
+    const user = raw.includes('@') ? raw.split('@')[0] : raw
+    const base = user.split(':')[0]
+    const d = digitsOnly(base)
+    if (d.length < 8 || d.length > 15) return ''
+    if (lidDigitsToReject && d === lidDigitsToReject) return ''
+    return d
   }
 
   /**
@@ -59,32 +69,60 @@ function createWhatsAppRuntime(config) {
    */
   async function resolveSenderPhone(msg) {
     const from = String(msg.from || '')
-    const direct = phoneFromChatId(from)
-    if (direct && direct.length >= 8) return direct
-
+    const lidDigits = isLidJid(from) ? digitsOnly(from.split('@')[0]) : ''
     const data = msg._data || {}
+
+    /** @type {{ phone: string, via: string }[]} */
+    const found = []
+    const consider = (value, via) => {
+      const phone = phoneFromValue(value, lidDigits)
+      if (phone) found.push({ phone, via })
+    }
+
+    consider(from, 'from')
     for (const key of ['senderPn', 'peerRecipientPn', 'recipientPn']) {
-      const cand = phoneFromChatId(data[key])
-      if (cand && cand.length >= 8) return cand
-      const d = digitsOnly(data[key])
-      if (d.length >= 8) return d
+      consider(data[key], key)
+    }
+
+    try {
+      if (client && typeof client.getContactLidAndPhone === 'function' && lidDigits) {
+        const rows = await client.getContactLidAndPhone([from])
+        for (const row of rows || []) {
+          consider(row?.pn || row?.phone || row?.pnJid || row, 'getContactLidAndPhone')
+        }
+      }
+    } catch (e) {
+      console.warn(
+        '[wa] getContactLidAndPhone failed',
+        e instanceof Error ? e.message : e,
+      )
     }
 
     try {
       const contact = await msg.getContact()
-      const n = digitsOnly(contact?.number || contact?.id?.user)
-      if (n.length >= 8 && !String(contact?.id?._serialized || '').endsWith('@lid')) {
-        return n
+      const ser = String(contact?.id?._serialized || '')
+      if (!isLidJid(ser)) {
+        consider(contact?.number, 'contact.number')
+        consider(contact?.id?.user, 'contact.user')
       }
       if (typeof contact?.getFormattedNumber === 'function') {
-        const formatted = digitsOnly(await contact.getFormattedNumber())
-        if (formatted.length >= 8) return formatted
+        consider(await contact.getFormattedNumber(), 'contact.formatted')
       }
     } catch (e) {
       console.warn('[wa] getContact phone resolve failed', e instanceof Error ? e.message : e)
     }
 
-    return direct
+    if (found.length) {
+      console.log('[wa] resolved phone', found[0].phone, 'via', found[0].via, 'chat=', from)
+      return found[0].phone
+    }
+
+    console.warn('[wa] could not resolve PN', {
+      from,
+      senderPn: data.senderPn || null,
+      peerRecipientPn: data.peerRecipientPn || null,
+    })
+    return ''
   }
 
   /**
