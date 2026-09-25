@@ -154,5 +154,6 @@ Tunnel 可另做一個 LaunchAgent 跑 `cloudflared tunnel run ws-bot`。
 |------|------|
 | 一直 QR | 手機網路、刪除舊「已連結裝置」後重掃；清 `.wwebjs_auth` 再試（會重登） |
 | ready 但無回覆 | `SK11_INBOUND_URL`、Railway 密鑰、SK11 是否已部署 inbound API |
+| `/health` 有 `lastError: No LID for user` | WhatsApp LID 問題；請更新本倉庫（`msg.reply` + `getNumberId` 後備）後重啟閘道 |
 | Railway 提醒發不出 | `WHATSAPP_GATEWAY_URL`、Tunnel、Bearer 密鑰 |
 | Chromium 起不來 | `npm install` 完整；macOS 允許相關權限 |
