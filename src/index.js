@@ -36,10 +36,25 @@ async function main() {
   const wa = createWhatsAppRuntime(config)
   const app = createServer(config, wa)
 
-  app.listen(config.port, config.host, () => {
-    console.log(`[ws-bot] listening http://${config.host}:${config.port}`)
-    console.log(`[ws-bot] pair page: /pair?token=***`)
-    console.log(`[ws-bot] health: /health`)
+  await new Promise((resolve, reject) => {
+    const server = app.listen(config.port, config.host, () => {
+      console.log(`[ws-bot] listening http://${config.host}:${config.port}`)
+      console.log(`[ws-bot] pair page: /pair?token=***`)
+      console.log(`[ws-bot] health: /health`)
+      resolve()
+    })
+    server.on('error', (err) => {
+      if (err && err.code === 'EADDRINUSE') {
+        console.error(
+          `[ws-bot] fatal: ${config.host}:${config.port} already in use (EADDRINUSE).` +
+            ' Kill the old process before restart, e.g.:\n' +
+            `  lsof -nP -iTCP:${config.port} -sTCP:LISTEN\n` +
+            '  kill <PID>\n' +
+            '  launchctl kickstart -k gui/$(id -u)/hk.11theridings.ws-bot-gateway',
+        )
+      }
+      reject(err)
+    })
   })
 
   wa.start()

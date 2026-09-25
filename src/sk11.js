@@ -26,9 +26,16 @@ async function forwardInbound(config, { from, text, messageId }) {
     }
     // Non-allowlist / silent deny → no WhatsApp reply
     if (json.ignored === true || json.reply == null) {
+      console.log('[sk11] ignored/null reply for', from, 'ignored=', json.ignored)
       return null
     }
     if (typeof json.reply !== 'string' || !json.reply.trim()) {
+      console.error('[sk11] bad reply payload', {
+        from,
+        status: res.status,
+        keys: Object.keys(json || {}),
+        replyType: typeof json.reply,
+      })
       throw new Error('SK11 response missing reply')
     }
     return json.reply

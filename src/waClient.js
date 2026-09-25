@@ -11,7 +11,7 @@ const { createSendGate } = require('./rateLimit')
  * @param {ReturnType<typeof import('./config').loadConfig>} config
  */
 function createWhatsAppRuntime(config) {
-  /** @type {{ ready: boolean, qr: string | null, qrDataUrl: string | null, me: string | null, lastError: string | null, lastInboundAt: string | null }} */
+  /** @type {{ ready: boolean, qr: string | null, qrDataUrl: string | null, me: string | null, lastError: string | null, lastInboundAt: string | null, lastInboundFrom: string | null }} */
   const state = {
     ready: false,
     qr: null,
@@ -19,6 +19,7 @@ function createWhatsAppRuntime(config) {
     me: null,
     lastError: null,
     lastInboundAt: null,
+    lastInboundFrom: null,
   }
 
   const sendGate = createSendGate(config.sendGapMs)
@@ -62,13 +63,11 @@ function createWhatsAppRuntime(config) {
     if (direct && direct.length >= 8) return direct
 
     const data = msg._data || {}
-    for (const key of ['senderPn', 'peerRecipientPn', 'recipientPn', 'notifyName']) {
+    for (const key of ['senderPn', 'peerRecipientPn', 'recipientPn']) {
       const cand = phoneFromChatId(data[key])
-      if (cand && cand.length >= 8 && key !== 'notifyName') return cand
-      if (key !== 'notifyName') {
-        const d = digitsOnly(data[key])
-        if (d.length >= 8) return d
-      }
+      if (cand && cand.length >= 8) return cand
+      const d = digitsOnly(data[key])
+      if (d.length >= 8) return d
     }
 
     try {
@@ -77,7 +76,6 @@ function createWhatsAppRuntime(config) {
       if (n.length >= 8 && !String(contact?.id?._serialized || '').endsWith('@lid')) {
         return n
       }
-      // Some builds expose phone via getFormattedNumber / userid
       if (typeof contact?.getFormattedNumber === 'function') {
         const formatted = digitsOnly(await contact.getFormattedNumber())
         if (formatted.length >= 8) return formatted
@@ -90,58 +88,81 @@ function createWhatsAppRuntime(config) {
   }
 
   /**
-   * Outbound send. Prefer explicit WhatsApp JID when provided (handles @lid / @g.us).
-   * Falls back to getNumberId for classic phone digits (avoids "No LID for user").
+   * Low-level send — must only be called from inside sendGate (no nested gate).
+   * @param {string} text
+   * @param {{ chatId?: string, toDigitsOrJid?: string }} opts
+   */
+  async function sendUnlocked(text, opts = {}) {
+    if (!client || !state.ready) {
+      return { ok: false, error: 'WhatsApp client not ready' }
+    }
+    const raw = String(opts.toDigitsOrJid || '').trim()
+    const preferred = opts.chatId ? String(opts.chatId) : ''
+    const digits = digitsOnly(raw.includes('@') ? raw.split('@')[0] : raw)
+
+    const attempts = []
+    if (preferred) attempts.push(preferred)
+    if (raw.includes('@')) attempts.push(raw)
+    // Avoid bare @c.us first when we already have a preferred LID/chat JID —
+    // WhatsApp often throws "No LID for user" for stale @c.us mapping.
+    if (digits && !preferred) attempts.push(`${digits}@c.us`)
+
+    let lastErr = 'send failed'
+    for (const chatId of [...new Set(attempts)]) {
+      try {
+        const msg = await client.sendMessage(chatId, text)
+        return { ok: true, messageId: msg?.id?._serialized || msg?.id?.id }
+      } catch (e) {
+        lastErr = e instanceof Error ? e.message : 'send failed'
+        console.warn('[wa] send attempt failed', chatId, lastErr)
+      }
+    }
+
+    // Resolve official WID (handles LID mapping)
+    if (digits && client.getNumberId) {
+      try {
+        const wid = await client.getNumberId(digits)
+        const jid = wid?._serialized || (wid?.user ? `${wid.user}@${wid.server || 'c.us'}` : '')
+        if (jid) {
+          const msg = await client.sendMessage(jid, text)
+          return { ok: true, messageId: msg?.id?._serialized || msg?.id?.id }
+        }
+      } catch (e) {
+        lastErr = e instanceof Error ? e.message : lastErr
+        console.warn('[wa] getNumberId send failed', lastErr)
+      }
+    }
+
+    // Last resort: classic @c.us even when preferred chat was tried
+    if (digits && preferred) {
+      try {
+        const msg = await client.sendMessage(`${digits}@c.us`, text)
+        return { ok: true, messageId: msg?.id?._serialized || msg?.id?.id }
+      } catch (e) {
+        lastErr = e instanceof Error ? e.message : lastErr
+      }
+    }
+
+    state.lastError = lastErr
+    return { ok: false, error: lastErr }
+  }
+
+  /**
+   * Outbound send for API /api/send. Single sendGate — never nest.
    * @param {string} toDigitsOrJid
    * @param {string} body
    * @param {{ chatId?: string }} [opts]
    */
   async function sendText(toDigitsOrJid, body, opts = {}) {
-    if (!client || !state.ready) {
-      return { ok: false, error: 'WhatsApp client not ready' }
-    }
     const text = body.length > 4000 ? `${body.slice(0, 3990)}…` : body
-    const raw = String(toDigitsOrJid || '').trim()
-    const preferred = opts.chatId ? String(opts.chatId) : ''
-    const digits = digitsOnly(raw.includes('@') ? raw.split('@')[0] : raw)
-
-    return sendGate(async () => {
-      const attempts = []
-      if (preferred) attempts.push(preferred)
-      if (raw.includes('@')) attempts.push(raw)
-      if (digits) attempts.push(`${digits}@c.us`)
-
-      let lastErr = 'send failed'
-      for (const chatId of [...new Set(attempts)]) {
-        try {
-          const msg = await client.sendMessage(chatId, text)
-          return { ok: true, messageId: msg?.id?._serialized || msg?.id?.id }
-        } catch (e) {
-          lastErr = e instanceof Error ? e.message : 'send failed'
-        }
-      }
-
-      // Resolve official WID (handles LID mapping)
-      if (digits && client.getNumberId) {
-        try {
-          const wid = await client.getNumberId(digits)
-          const jid = wid?._serialized || (wid?.user ? `${wid.user}@${wid.server || 'c.us'}` : '')
-          if (jid) {
-            const msg = await client.sendMessage(jid, text)
-            return { ok: true, messageId: msg?.id?._serialized || msg?.id?.id }
-          }
-        } catch (e) {
-          lastErr = e instanceof Error ? e.message : lastErr
-        }
-      }
-
-      state.lastError = lastErr
-      return { ok: false, error: lastErr }
-    })
+    return sendGate(() =>
+      sendUnlocked(text, { toDigitsOrJid, chatId: opts.chatId }),
+    )
   }
 
   /**
-   * Prefer Message#reply so WhatsApp uses the same chat thread (LID-safe).
+   * Prefer Message#reply / chat.sendMessage so WhatsApp uses the same thread (LID-safe).
+   * Fallback uses sendUnlocked inside the SAME gate — never nest sendGate (deadlock).
    * @param {import('whatsapp-web.js').Message} msg
    * @param {string} body
    */
@@ -155,10 +176,27 @@ function createWhatsAppRuntime(config) {
         }
       } catch (e) {
         const err = e instanceof Error ? e.message : 'reply failed'
-        console.warn('[wa] msg.reply failed, falling back to sendText', err)
+        console.warn('[wa] msg.reply failed, trying getChat', err)
       }
+
+      try {
+        if (typeof msg.getChat === 'function') {
+          const chat = await msg.getChat()
+          if (chat && typeof chat.sendMessage === 'function') {
+            const sent = await chat.sendMessage(text)
+            return { ok: true, messageId: sent?.id?._serialized || sent?.id?.id }
+          }
+        }
+      } catch (e) {
+        const err = e instanceof Error ? e.message : 'chat.sendMessage failed'
+        console.warn('[wa] chat.sendMessage failed, falling back', err)
+      }
+
       const phone = await resolveSenderPhone(msg)
-      return sendText(phone || msg.from, text, { chatId: msg.from })
+      return sendUnlocked(text, {
+        toDigitsOrJid: phone || msg.from,
+        chatId: msg.from,
+      })
     })
   }
 
@@ -183,7 +221,7 @@ function createWhatsAppRuntime(config) {
 
       const from = await resolveSenderPhone(msg)
       if (!from) {
-        console.warn('[wa] could not resolve sender phone from', msg.from)
+        console.warn('[wa] could not resolve sender phone from', msg.from, 'dataKeys=', Object.keys(msg._data || {}))
         return
       }
       if (!isPhoneAllowed(from)) {
@@ -198,6 +236,7 @@ function createWhatsAppRuntime(config) {
       }
 
       state.lastInboundAt = new Date().toISOString()
+      state.lastInboundFrom = from
       console.log('[wa] inbound', from, text.slice(0, 80), 'chat=', msg.from)
 
       let reply
@@ -206,7 +245,6 @@ function createWhatsAppRuntime(config) {
       } catch (e) {
         const err = e instanceof Error ? e.message : 'SK11 error'
         console.error('[wa] SK11 forward failed', err)
-        // Common: Unauthorized = BRIDGE_SECRET mismatch with Railway
         reply =
           '系統暫時無法處理，請稍後再試或登入網頁操作。\n' +
           'System temporarily unavailable. Please try again or use the web app.'
@@ -222,8 +260,10 @@ function createWhatsAppRuntime(config) {
       }
 
       const sent = await replyToMessage(msg, reply)
-      if (!sent.ok) console.error('[wa] reply send failed', sent.error)
-      else if (state.lastError && /No LID/i.test(state.lastError)) {
+      if (!sent.ok) {
+        console.error('[wa] reply send failed', sent.error)
+        state.lastError = sent.error || state.lastError
+      } else if (state.lastError && /No LID/i.test(state.lastError)) {
         state.lastError = null
       }
     } catch (e) {

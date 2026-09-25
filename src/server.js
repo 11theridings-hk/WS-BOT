@@ -19,6 +19,7 @@ function createServer(config, wa) {
       ready: s.ready,
       me: s.me,
       lastInboundAt: s.lastInboundAt,
+      lastInboundFrom: s.lastInboundFrom || null,
       lastError: s.lastError,
     })
   })
@@ -33,6 +34,7 @@ function createServer(config, wa) {
       qr: s.qr,
       qrDataUrl: s.qrDataUrl,
       lastInboundAt: s.lastInboundAt,
+      lastInboundFrom: s.lastInboundFrom || null,
       lastError: s.lastError,
     })
   })
