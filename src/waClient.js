@@ -8,7 +8,7 @@ const { forwardInbound } = require('./sk11')
 const { createSendGate } = require('./rateLimit')
 
 /**
- * @param {ReturnType<import('./config').loadConfig>} config
+ * @param {ReturnType<typeof import('./config').loadConfig>} config
  */
 function createWhatsAppRuntime(config) {
   /** @type {{ ready: boolean, qr: string | null, qrDataUrl: string | null, me: string | null, lastError: string | null, lastInboundAt: string | null }} */
@@ -38,36 +38,133 @@ function createWhatsAppRuntime(config) {
     return false
   }
 
-  function phoneFromChatId(chatId) {
-    // "85291234567@c.us" → "85291234567"
-    return String(chatId || '')
-      .split('@')[0]
-      .replace(/\D/g, '')
+  function digitsOnly(value) {
+    return String(value || '').replace(/\D/g, '')
   }
 
-  async function sendText(toDigits, body) {
+  /**
+   * Extract E.164-ish digits from chat id or PN fields.
+   * Supports classic `@c.us` and newer `@lid` (needs senderPn / contact).
+   */
+  function phoneFromChatId(chatId) {
+    const raw = String(chatId || '')
+    if (raw.endsWith('@lid')) return ''
+    return digitsOnly(raw.split('@')[0])
+  }
+
+  /**
+   * Resolve real phone digits for SK11 binding / allowlist.
+   * @param {import('whatsapp-web.js').Message} msg
+   */
+  async function resolveSenderPhone(msg) {
+    const from = String(msg.from || '')
+    const direct = phoneFromChatId(from)
+    if (direct && direct.length >= 8) return direct
+
+    const data = msg._data || {}
+    for (const key of ['senderPn', 'peerRecipientPn', 'recipientPn', 'notifyName']) {
+      const cand = phoneFromChatId(data[key])
+      if (cand && cand.length >= 8 && key !== 'notifyName') return cand
+      if (key !== 'notifyName') {
+        const d = digitsOnly(data[key])
+        if (d.length >= 8) return d
+      }
+    }
+
+    try {
+      const contact = await msg.getContact()
+      const n = digitsOnly(contact?.number || contact?.id?.user)
+      if (n.length >= 8 && !String(contact?.id?._serialized || '').endsWith('@lid')) {
+        return n
+      }
+      // Some builds expose phone via getFormattedNumber / userid
+      if (typeof contact?.getFormattedNumber === 'function') {
+        const formatted = digitsOnly(await contact.getFormattedNumber())
+        if (formatted.length >= 8) return formatted
+      }
+    } catch (e) {
+      console.warn('[wa] getContact phone resolve failed', e instanceof Error ? e.message : e)
+    }
+
+    return direct
+  }
+
+  /**
+   * Outbound send. Prefer explicit WhatsApp JID when provided (handles @lid / @g.us).
+   * Falls back to getNumberId for classic phone digits (avoids "No LID for user").
+   * @param {string} toDigitsOrJid
+   * @param {string} body
+   * @param {{ chatId?: string }} [opts]
+   */
+  async function sendText(toDigitsOrJid, body, opts = {}) {
     if (!client || !state.ready) {
       return { ok: false, error: 'WhatsApp client not ready' }
     }
-    const digits = String(toDigits || '').replace(/\D/g, '')
-    if (!digits) return { ok: false, error: 'Invalid recipient' }
     const text = body.length > 4000 ? `${body.slice(0, 3990)}…` : body
-    const chatId = `${digits}@c.us`
+    const raw = String(toDigitsOrJid || '').trim()
+    const preferred = opts.chatId ? String(opts.chatId) : ''
+    const digits = digitsOnly(raw.includes('@') ? raw.split('@')[0] : raw)
 
     return sendGate(async () => {
-      try {
-        const msg = await client.sendMessage(chatId, text)
-        return { ok: true, messageId: msg?.id?._serialized || msg?.id?.id }
-      } catch (e) {
-        const err = e instanceof Error ? e.message : 'send failed'
-        state.lastError = err
-        return { ok: false, error: err }
+      const attempts = []
+      if (preferred) attempts.push(preferred)
+      if (raw.includes('@')) attempts.push(raw)
+      if (digits) attempts.push(`${digits}@c.us`)
+
+      let lastErr = 'send failed'
+      for (const chatId of [...new Set(attempts)]) {
+        try {
+          const msg = await client.sendMessage(chatId, text)
+          return { ok: true, messageId: msg?.id?._serialized || msg?.id?.id }
+        } catch (e) {
+          lastErr = e instanceof Error ? e.message : 'send failed'
+        }
       }
+
+      // Resolve official WID (handles LID mapping)
+      if (digits && client.getNumberId) {
+        try {
+          const wid = await client.getNumberId(digits)
+          const jid = wid?._serialized || (wid?.user ? `${wid.user}@${wid.server || 'c.us'}` : '')
+          if (jid) {
+            const msg = await client.sendMessage(jid, text)
+            return { ok: true, messageId: msg?.id?._serialized || msg?.id?.id }
+          }
+        } catch (e) {
+          lastErr = e instanceof Error ? e.message : lastErr
+        }
+      }
+
+      state.lastError = lastErr
+      return { ok: false, error: lastErr }
+    })
+  }
+
+  /**
+   * Prefer Message#reply so WhatsApp uses the same chat thread (LID-safe).
+   * @param {import('whatsapp-web.js').Message} msg
+   * @param {string} body
+   */
+  async function replyToMessage(msg, body) {
+    const text = body.length > 4000 ? `${body.slice(0, 3990)}…` : body
+    return sendGate(async () => {
+      try {
+        if (typeof msg.reply === 'function') {
+          const sent = await msg.reply(text)
+          return { ok: true, messageId: sent?.id?._serialized || sent?.id?.id }
+        }
+      } catch (e) {
+        const err = e instanceof Error ? e.message : 'reply failed'
+        console.warn('[wa] msg.reply failed, falling back to sendText', err)
+      }
+      const phone = await resolveSenderPhone(msg)
+      return sendText(phone || msg.from, text, { chatId: msg.from })
     })
   }
 
   function isPhoneAllowed(digits) {
     if (!config.allowedPhones) return true
+    if (!digits) return false
     if (config.allowedPhones.has(digits)) return true
     return [...config.allowedPhones].some(
       (p) => digits === p || digits.endsWith(p) || p.endsWith(digits),
@@ -78,14 +175,17 @@ function createWhatsAppRuntime(config) {
     try {
       if (msg.fromMe) return
       if (msg.isStatus) return
-      // groups: skip for finance bot
+      // groups: broadcast-only — no interactive replies in groups
       if (String(msg.from || '').endsWith('@g.us')) return
 
       const messageId = msg.id?._serialized || msg.id?.id || ''
       if (rememberMessageId(messageId)) return
 
-      const from = phoneFromChatId(msg.from)
-      if (!from) return
+      const from = await resolveSenderPhone(msg)
+      if (!from) {
+        console.warn('[wa] could not resolve sender phone from', msg.from)
+        return
+      }
       if (!isPhoneAllowed(from)) {
         console.warn('[wa] ignored non-allowlisted', from)
         return
@@ -93,12 +193,12 @@ function createWhatsAppRuntime(config) {
 
       const text = (msg.body || '').trim()
       if (!text) {
-        await sendText(from, '目前只支援文字指令。請傳送「幫助」。')
+        await replyToMessage(msg, '目前只支援文字指令。請傳送「幫助」或 help。')
         return
       }
 
       state.lastInboundAt = new Date().toISOString()
-      console.log('[wa] inbound', from, text.slice(0, 80))
+      console.log('[wa] inbound', from, text.slice(0, 80), 'chat=', msg.from)
 
       let reply
       try {
@@ -106,13 +206,17 @@ function createWhatsAppRuntime(config) {
       } catch (e) {
         const err = e instanceof Error ? e.message : 'SK11 error'
         console.error('[wa] SK11 forward failed', err)
-        reply = '系統暫時無法處理，請稍後再試或登入網頁操作。'
+        reply = '系統暫時無法處理，請稍後再試或登入網頁操作。\nSystem temporarily unavailable. Please try again or use the web app.'
       }
 
-      const sent = await sendText(from, reply)
+      const sent = await replyToMessage(msg, reply)
       if (!sent.ok) console.error('[wa] reply send failed', sent.error)
+      else if (state.lastError && /No LID/i.test(state.lastError)) {
+        state.lastError = null
+      }
     } catch (e) {
       console.error('[wa] handleIncoming error', e)
+      state.lastError = e instanceof Error ? e.message : String(e)
     }
   }
 
